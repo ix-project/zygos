@@ -40,6 +40,7 @@
 #define IXEV_SEND_WIN_SIZE	65536
 
 static __thread uint64_t ixev_generation;
+static __thread void *tid;
 static struct ixev_conn_ops ixev_global_ops;
 
 static struct mempool_datastore ixev_buf_datastore;
@@ -47,8 +48,9 @@ __thread struct mempool ixev_buf_pool;
 
 static inline void __ixev_check_generation(struct ixev_ctx *ctx)
 {
-	if (ixev_generation != ctx->generation) {
+	if (ixev_generation != ctx->generation || tid != ctx->tid) {
 		ctx->generation = ixev_generation;
+		ctx->tid = tid;
 		ctx->recv_done_desc = NULL;
 		ctx->sendv_desc = NULL;
 	}
@@ -464,6 +466,7 @@ void ixev_ctx_init(struct ixev_ctx *ctx)
 	ctx->recv_done_desc = NULL;
 	ctx->sendv_desc = NULL;
 	ctx->generation = 0;
+	ctx->tid = tid;
 	ctx->is_dead = false;
 
 	ctx->send_total = 0;
@@ -613,6 +616,10 @@ void ixev_set_handler(struct ixev_ctx *ctx, unsigned int mask,
 int ixev_init_thread(void)
 {
 	int ret;
+
+	/* sys_baddr() returns a unique pointer for each thread and we use it as
+	 * a unique thread identifier. */
+	tid = sys_baddr();
 
 	ret = mempool_create(&ixev_buf_pool, &ixev_buf_datastore);
 	if (ret)

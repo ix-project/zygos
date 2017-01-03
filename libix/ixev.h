@@ -76,6 +76,7 @@ struct ixev_ctx {
 	hid_t		handle;			/* the IX flow handle */
 	unsigned long	user_data;		/* application data */
 	uint64_t	generation;		/* generation number */
+	void 		*tid;			/* generation thread id */
 	ixev_handler_t	handler;		/* the event handler */
 	unsigned int	en_mask;		/* a mask of enabled events */
 	unsigned int	trig_mask;		/* a mask of triggered events */

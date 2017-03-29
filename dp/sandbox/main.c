@@ -296,7 +296,7 @@ static int run_app(uintptr_t sp, uintptr_t e_entry)
 	memset(&tf, 0, sizeof(struct dune_tf));
 	tf.rip = e_entry;
 	tf.rsp = sp;
-	tf.rflags = 0x0;
+	tf.rflags = FL_IF;
 
 	return dune_jump_to_user(&tf);
 }

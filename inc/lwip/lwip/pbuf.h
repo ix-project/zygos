@@ -60,6 +60,7 @@
 #include "lwip/err.h"
 
 #include <ix/mbuf.h>
+#include <ix/queue.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -113,6 +114,8 @@ struct pbuf {
   /** next pbuf in singly linked pbuf chain */
   struct pbuf *next;
   struct pbuf *tcp_api_next;
+
+  struct queue_node pbuf_for_usys;
 
   /** pointer to the actual data in the buffer */
   void *payload;

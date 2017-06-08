@@ -172,6 +172,7 @@ enum {
 	KSYS_TCP_SENDV,
 	KSYS_TCP_RECV_DONE,
 	KSYS_TCP_CLOSE,
+	KSYS_NOP,
 	KSYS_NR,
 };
 
@@ -332,6 +333,17 @@ enum {
 
 DECLARE_PERCPU(struct bsys_arr *, usys_arr);
 DECLARE_PERCPU(unsigned long, syscall_cookie);
+
+#define LOCKED_BSYS_MAX_LEN 4096
+
+struct locked_bsys_arr {
+       spinlock_t lock;
+       int len;
+       struct bsys_desc descs[LOCKED_BSYS_MAX_LEN];
+};
+
+DECLARE_PERCPU(bool, in_kernel);
+DECLARE_PERCPU(struct locked_bsys_arr, ksys_remote);
 
 /**
  * usys_reset - reset the batched call array

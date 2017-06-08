@@ -45,6 +45,7 @@
 #include <ix/utimer.h>
 #include <ix/stats.h>
 #include <ix/debug_desc.h>
+#include <ix/tcp_api.h>
 
 #include <dune.h>
 
@@ -55,9 +56,17 @@ DEFINE_PERCPU(void *, usys_iomap);
 DEFINE_PERCPU(unsigned long, syscall_cookie);
 DEFINE_PERCPU(unsigned long, idle_cycles);
 
+// TODO: make struct with volatile field
+DEFINE_PERCPU(bool, in_kernel);
+DEFINE_PERCPU(struct locked_bsys_arr, ksys_remote);
+
 static const int usys_nr = div_up(sizeof(struct bsys_arr) +
 				  UARR_MIN_CAPACITY * sizeof(struct bsys_desc),
 				  PGSIZE_2MB);
+
+static void bsys_nop(void)
+{
+}
 
 static bsysfn_t bsys_tbl[] = {
 	(bsysfn_t) bsys_udp_send,
@@ -70,6 +79,7 @@ static bsysfn_t bsys_tbl[] = {
 	(bsysfn_t) bsys_tcp_sendv,
 	(bsysfn_t) bsys_tcp_recv_done,
 	(bsysfn_t) bsys_tcp_close,
+	(bsysfn_t) bsys_nop,
 };
 
 static int bsys_dispatch_one(struct bsys_desc __user *d)
@@ -134,9 +144,8 @@ static int bsys_dispatch(struct bsys_desc __user *d, unsigned int nr)
  */
 static int sys_bpoll(struct bsys_desc __user *d, unsigned int nr)
 {
-	int ret, empty;
+	int ret = 0, empty;
 
-	usys_reset();
 
 	KSTATS_PUSH(tx_reclaim, NULL);
 	eth_process_reclaim();
@@ -146,8 +155,14 @@ static int sys_bpoll(struct bsys_desc __user *d, unsigned int nr)
 	ret = bsys_dispatch(d, nr);
 	KSTATS_POP(NULL);
 
+	KSTATS_PUSH(tcp_finish_usys, NULL);
+	tcp_finish_usys();
+	KSTATS_POP(NULL);
+
+	usys_reset();
+
 	if (ret)
-		return ret;
+		goto out;
 
 again:
 
@@ -163,14 +178,14 @@ again:
 			 * space for the processing of the events. We
 			 * will delay the migration until we are in a
 			 * quiescent state. */
-			return 0;
+			goto out;
 		}
 		eth_fg_assign_to_cpu((bitmap_ptr) percpu_get(cp_cmd)->migrate.fg_bitmap, percpu_get(cp_cmd)->migrate.cpu);
 		percpu_get(cp_cmd)->cmd_id = CP_CMD_NOP;
 		break;
 	case CP_CMD_IDLE:
 		if (percpu_get(usys_arr)->len)
-			return 0;
+			goto out;
 		cp_idle();
 	case CP_CMD_NOP:
 		break;
@@ -197,6 +212,10 @@ again:
 	eth_process_send();
 	KSTATS_POP(NULL);
 
+	KSTATS_PUSH(tcp_generate_usys, NULL);
+	tcp_generate_usys();
+	KSTATS_POP(NULL);
+
 	if (!nr && !percpu_get(usys_arr)->len) {
 		/* Do not idle if control plane sets the no_idle flag. */
 		if (empty && !percpu_get(cp_cmd)->no_idle) {
@@ -219,7 +238,8 @@ again:
 		goto again;
 	}
 
-	return 0;
+out:
+	return ret;
 }
 
 /**

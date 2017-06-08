@@ -63,3 +63,5 @@ DEF_KSTATS(bsys_udp_send);
 DEF_KSTATS(bsys_udp_sendv);
 
 DEF_KSTATS(posix_syscall);
+DEF_KSTATS(tcp_finish_usys);
+DEF_KSTATS(tcp_generate_usys);

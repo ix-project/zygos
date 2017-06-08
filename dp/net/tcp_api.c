@@ -35,6 +35,8 @@
 #include <ix/kstats.h>
 #include <ix/cfg.h>
 #include <ix/config.h>
+#include <ix/stats.h>
+#include <ix/queue.h>
 
 #include <lwip/tcp.h>
 
@@ -57,6 +59,9 @@ static DEFINE_PERCPU(struct timer, print_conn_timer);
 
 #endif
 
+#define PCB_FLAG_READY 1
+#define PCB_FLAG_CLOSED 2
+
 /*
  * FIXME: LWIP and IX have different lifetime rules so we have to maintain
  * a seperate pcb. Otherwise, we'd be plagued by use-after-free problems.
@@ -72,7 +77,17 @@ struct tcpapi_pcb {
 	struct pbuf *recvd_tail;
 	int queue;
 	bool accepted;
+	int sent_len;
+	int len_xmited;
+	struct queue pbuf_for_usys;
+	struct queue_node ready_queue;
+	int active_usys_count;
+	char uevents;
+	char flags;
 };
+
+#define PCB_UEVENT_KNOCK 1
+#define PCB_UEVENT_CONNECTED 2
 
 static struct mempool_datastore pcb_datastore;
 static struct mempool_datastore id_datastore;
@@ -80,7 +95,28 @@ static struct mempool_datastore id_datastore;
 static DEFINE_PERCPU(struct mempool, pcb_mempool __attribute__((aligned(64))));
 static DEFINE_PERCPU(struct mempool, id_mempool __attribute__((aligned(64))));
 
+struct pcb_ready_queue {
+	struct queue queue;
+	spinlock_t lock;
+};
+
+static DEFINE_PERCPU(struct pcb_ready_queue, pcb_ready_queue);
+static DEFINE_PERCPU(struct drand48_data, drand48_data);
+
 static void remove_fdir_filter(struct ip_tuple *id);
+
+static inline int handle_to_fg_id(hid_t handle)
+{
+	return (handle >> 48) & 0xffff;
+}
+
+static struct tcpapi_pcb *__handle_to_tcpapi(hid_t handle)
+{
+	struct mempool *p;
+	unsigned long idx = (handle & 0xffffffffffff);
+	p = &percpu_get(pcb_mempool);
+	return (struct tcpapi_pcb *) mempool_idx_to_ptr(p, idx);
+}
 
 /**
  * handle_to_tcpapi - converts a handle to a PCB
@@ -90,21 +126,16 @@ static void remove_fdir_filter(struct ip_tuple *id);
  */
 static inline struct tcpapi_pcb *handle_to_tcpapi(hid_t handle, struct eth_fg **new_cur_fg)
 {
-	struct mempool *p;
 	struct tcpapi_pcb *api;
-	int fg = ((handle >> 48) & 0xffff);
-	unsigned long idx = (handle & 0xffffffffffff);
+	int fg = handle_to_fg_id(handle);
 
 	if (unlikely(fg >= ETH_MAX_TOTAL_FG + NCPU))
-		return NULL;
-	if (unlikely(idx >= MAX_PCBS))
 		return NULL;
 
 	*new_cur_fg = fgs[fg];
 	eth_fg_set_current(fgs[fg]);
-	p = &percpu_get(pcb_mempool);
 
-	api = (struct tcpapi_pcb *) mempool_idx_to_ptr(p, idx);
+	api = __handle_to_tcpapi(handle);
 	MEMPOOL_SANITY_ACCESS(api);
 
 	/* check if the handle is actually allocated */
@@ -130,20 +161,262 @@ static inline hid_t tcpapi_to_handle(struct eth_fg *cur_fg, struct tcpapi_pcb *p
 	return hid;
 }
 
-static void recv_a_pbuf(struct tcpapi_pcb *api, struct pbuf *p)
+static void pcb_ready_enqueue(struct tcpapi_pcb *api)
+{
+	assert(fgs[handle_to_fg_id(api->handle)]->cur_cpu == percpu_get(cpu_id));
+
+	if (api->active_usys_count) {
+		api->flags |= PCB_FLAG_READY;
+		return;
+	}
+
+	queue_push_back(&percpu_get(pcb_ready_queue).queue, &api->ready_queue);
+}
+
+static void __tcp_gen_usys(struct tcpapi_pcb *api)
 {
 	struct mbuf *pkt;
+	struct pbuf *p, *pbufs;
+	void *id;
+
+	assert(!api->flags);
+	assert(!api->active_usys_count);
+
+	log_debug("%lx: __tcp_gen_usys(%lx)\n", api, api->handle);
+
+	if (api->uevents & PCB_UEVENT_KNOCK) {
+		id = mempool_pagemem_to_iomap(&percpu_get(id_mempool), api->id);
+		log_debug("%lx: usys_tcp_knock(%lx, %lx)\n", api, api->handle, id);
+		usys_tcp_knock(api->handle, id);
+		api->active_usys_count++;
+	}
+
+	if (api->uevents & PCB_UEVENT_CONNECTED) {
+		log_debug("%lx: usys_tcp_connected(%lx, %lx, %d)\n", api, api->handle, api->cookie, RET_OK);
+		usys_tcp_connected(api->handle, api->cookie, RET_OK);
+		api->active_usys_count++;
+	}
+
+	api->uevents = 0;
+
+	if (api->len_xmited) {
+		log_debug("%lx: usys_tcp_sendv_ret(%lx, %lx, %d)\n", api, api->handle, api->cookie, api->len_xmited);
+		usys_tcp_sendv_ret(api->handle, api->cookie, api->len_xmited);
+		api->len_xmited = 0;
+		api->active_usys_count++;
+	}
+
+	if (api->sent_len) {
+		log_debug("%lx: usys_tcp_sent(%lx, %lx, %d)\n", api, api->handle, api->cookie, api->sent_len);
+		usys_tcp_sent(api->handle, api->cookie, api->sent_len);
+		api->sent_len = 0;
+		api->active_usys_count++;
+	}
+
+	queue_for_each_entry(pbufs, &api->pbuf_for_usys, pbuf_for_usys) {
+		p = pbufs;
+		/* Walk through the full receive chain */
+		do {
+			pkt = p->mbuf;
+			pkt->len = p->len; /* repurpose len for recv_done */
+			log_debug("%lx: usys_tcp_recv(%lx, %lx, %lx, %d)\n", api, api->handle, api->cookie, mbuf_to_iomap(pkt, p->payload), p->len);
+			usys_tcp_recv(api->handle, api->cookie, mbuf_to_iomap(pkt, p->payload), p->len);
+			api->active_usys_count++;
+			p = p->next;
+		} while (p);
+	}
+
+	queue_clear(&api->pbuf_for_usys);
+
+	if (!api->alive) {
+		log_debug("%lx: usys_tcp_dead(%lx, %lx)\n", api, api->handle, api->cookie);
+		usys_tcp_dead(api->handle, api->cookie);
+		api->active_usys_count++;
+	}
+}
+
+static bool ksys_is_tcp(const struct bsys_desc *desc)
+{
+	switch (desc->sysnr) {
+	case KSYS_TCP_CONNECT:
+	case KSYS_TCP_ACCEPT:
+	case KSYS_TCP_REJECT:
+	case KSYS_TCP_SEND:
+	case KSYS_TCP_SENDV:
+	case KSYS_TCP_RECV_DONE:
+	case KSYS_TCP_CLOSE:
+		return true;
+	}
+
+	return false;
+}
+
+static bool usys_is_tcp(const struct bsys_desc *desc)
+{
+	switch (desc->sysnr) {
+	case USYS_TCP_CONNECTED:
+	case USYS_TCP_KNOCK:
+	case USYS_TCP_RECV:
+	case USYS_TCP_SENT:
+	case USYS_TCP_DEAD:
+	case USYS_TCP_SENDV_RET:
+		return true;
+	}
+	return false;
+}
+
+static int bsys_tcp_home_id(const struct bsys_desc *desc)
+{
+   return fgs[handle_to_fg_id(desc->arga)]->cur_cpu;
+}
+
+void tcp_route_ksys(struct bsys_desc __user *d, unsigned int nr)
+{
+	int i, home;
+	struct locked_bsys_arr *remote;
+
+	for (i = 0; i < nr; i++) {
+		if (!ksys_is_tcp(&d[i]))
+			continue;
+
+		home = bsys_tcp_home_id(&d[i]);
+		if (home == percpu_get(cpu_id))
+			continue;
+
+		log_debug("ksys route to remote %d %lx %lx %lx %lx\n", d[i].sysnr, d[i].arga, d[i].argb, d[i].argc, d[i].argd);
+
+		remote = &percpu_get_remote(ksys_remote, home);
+		spin_lock(&remote->lock);
+		assert(remote->len < LOCKED_BSYS_MAX_LEN);
+		remote->descs[remote->len++] = d[i];
+		d[i].sysnr = KSYS_NOP;
+		spin_unlock(&remote->lock);
+	}
+}
+
+static void __tcp_finish_usys(void *_api)
+{
+	struct tcpapi_pcb *api = (struct tcpapi_pcb *) _api;
+
+	bsys_dispatch_remote();
+
+	spin_lock(&percpu_get(pcb_ready_queue).lock);
+	api->active_usys_count--;
+	if (!api->active_usys_count && api->flags & PCB_FLAG_CLOSED) {
+		mempool_free(&percpu_get(pcb_mempool), api);
+	} else if (!api->active_usys_count && api->flags & PCB_FLAG_READY) {
+		api->flags &= ~PCB_FLAG_READY;
+		pcb_ready_enqueue(api);
+	}
+	spin_unlock(&percpu_get(pcb_ready_queue).lock);
+}
+
+void tcp_finish_usys(void)
+{
+	int i, home;
+	struct tcpapi_pcb *api;
+	struct bsys_desc *descs = percpu_get(usys_arr)->descs;
+
+	for (i = 0; i < percpu_get(usys_arr)->len; i++) {
+		if (!usys_is_tcp(&descs[i]))
+			continue;
+
+		api = __handle_to_tcpapi(descs[i].arga);
+
+		home = bsys_tcp_home_id(&descs[i]);
+		if (home == percpu_get(cpu_id))
+			__tcp_finish_usys(api);
+		else
+			cpu_run_on_one(__tcp_finish_usys, api, home);
+	}
+}
+
+void tcp_generate_usys(void)
+{
+	struct pcb_ready_queue *queue;
+	struct queue_node *n;
+	struct tcpapi_pcb *api;
+
+	queue = &percpu_get(pcb_ready_queue);
+
+	spin_lock(&queue->lock);
+	n = queue_pop_front(&queue->queue);
+	spin_unlock(&queue->lock);
+
+	if (n) {
+		api = container_of(n, struct tcpapi_pcb, ready_queue);
+		__tcp_gen_usys(api);
+	}
+}
+
+void tcp_steal_idle_wait(uint64_t usecs)
+{
+	int count, cpu_id, i, ok = 0;
+	long rnd;
+	unsigned char cpus[NCPU];
+	unsigned long deadline;
+	struct eth_rx_queue *rxq;
+	struct pcb_ready_queue *remote_queue;
+	struct tcpapi_pcb *api;
+	struct queue_node *n;
+
+	deadline = rdtsc() + usecs * cycles_per_us;
+	do {
+		if (percpu_get(ksys_remote).len)
+			return;
+
+		for (i = 0; i < percpu_get(eth_num_queues); i++) {
+			rxq = percpu_get(eth_rxqs[i]);
+			if(rxq->ready(rxq))
+				return;
+		}
+
+		count = 0;
+		for (i = 0; i < CFG.num_cpus; i++) {
+			if (percpu_get_remote(in_kernel, CFG.cpu[i]))
+				continue;
+
+			remote_queue = &percpu_get_remote(pcb_ready_queue, CFG.cpu[i]);
+			if (queue_front(&remote_queue->queue))
+				cpus[count++] = CFG.cpu[i];
+		}
+
+		if (count) {
+			lrand48_r(&percpu_get(drand48_data), &rnd);
+			cpu_id = cpus[rnd % count];
+
+			log_debug("steal attempt from %d\n", cpu_id);
+			remote_queue = &percpu_get_remote(pcb_ready_queue, cpu_id);
+			if (spin_try_lock(&remote_queue->lock)) {
+				n = queue_front(&remote_queue->queue);
+				api = container_of(n, struct tcpapi_pcb, ready_queue);
+				log_debug("steal from %d %lx\n", cpu_id, api);
+				if (n) {
+					assert(!api->flags);
+					log_debug("steal success from %d %lx\n", cpu_id, api);
+					queue_pop_front(&remote_queue->queue);
+					__tcp_gen_usys(api);
+					ok = 1;
+				}
+				spin_unlock(&remote_queue->lock);
+			}
+
+			if (ok)
+				return;
+		}
+		cpu_relax();
+	} while (rdtsc() < deadline);
+}
+
+static void recv_a_pbuf(struct tcpapi_pcb *api, struct pbuf *p)
+{
 	MEMPOOL_SANITY_LINK(api, p);
 
-	/* Walk through the full receive chain */
-	do {
-		pkt = p->mbuf;
-		pkt->len = p->len; /* repurpose len for recv_done */
-		usys_tcp_recv(api->handle, api->cookie,
-			      mbuf_to_iomap(pkt, p->payload), p->len);
-
-		p = p->next;
-	} while (p);
+	spin_lock(&percpu_get(pcb_ready_queue).lock);
+	queue_push_back(&api->pbuf_for_usys, &p->pbuf_for_usys);
+	assert(api->pbuf_for_usys.tail == &p->pbuf_for_usys);
+	pcb_ready_enqueue(api);
+	spin_unlock(&percpu_get(pcb_ready_queue).lock);
 }
 
 long bsys_tcp_accept(hid_t handle, unsigned long cookie)
@@ -274,7 +547,10 @@ ssize_t bsys_tcp_sendv(hid_t handle, struct sg_entry __user *ents,
 
 	if (len_xmited) {
 		tcp_output(cur_fg, api->pcb);
-		usys_tcp_sendv_ret(api->handle, api->cookie, len_xmited);
+		spin_lock(&percpu_get(pcb_ready_queue).lock);
+		api->len_xmited += len_xmited;
+		pcb_ready_enqueue(api);
+		spin_unlock(&percpu_get(pcb_ready_queue).lock);
 	}
 
 	return 0;
@@ -345,7 +621,10 @@ long bsys_tcp_close(hid_t handle)
 		mempool_free(&percpu_get(id_mempool), api->id);
 	}
 
-	mempool_free(&percpu_get(pcb_mempool), api);
+	if (api->active_usys_count)
+		api->flags |= PCB_FLAG_CLOSED;
+	else
+		mempool_free(&percpu_get(pcb_mempool), api);
 	return RET_OK;
 }
 
@@ -378,8 +657,10 @@ static void mark_dead(struct tcpapi_pcb *api, unsigned long cookie)
 	if (api->id)
 		remove_fdir_filter(api->id);
 
+	spin_lock(&percpu_get(pcb_ready_queue).lock);
 	api->alive = false;
-	usys_tcp_dead(api->handle, api->cookie);
+	pcb_ready_enqueue(api);
+	spin_unlock(&percpu_get(pcb_ready_queue).lock);
 }
 
 static err_t on_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t err)
@@ -457,7 +738,10 @@ static err_t on_sent(void *arg, struct tcp_pcb *pcb, u16_t len)
 		  arg, pcb, len);
 
 	api = (struct tcpapi_pcb *) arg;
-	usys_tcp_sent(api->handle, api->cookie, len);
+	spin_lock(&percpu_get(pcb_ready_queue).lock);
+	api->sent_len += len;
+	pcb_ready_enqueue(api);
+	spin_unlock(&percpu_get(pcb_ready_queue).lock);
 
 	return ERR_OK;
 }
@@ -487,6 +771,13 @@ static err_t on_accept(struct eth_fg *cur_fg, void *arg, struct tcp_pcb *pcb, er
 	api->recvd = NULL;
 	api->recvd_tail = NULL;
 	api->accepted = false;
+	api->sent_len = 0;
+	api->len_xmited = 0;
+	init_queue(&api->pbuf_for_usys);
+	init_queue_node(&api->ready_queue);
+	api->active_usys_count = 0;
+	api->uevents = 0;
+	api->flags = 0;
 
 	tcp_nagle_disable(pcb);
 	tcp_arg(pcb, api);
@@ -504,14 +795,16 @@ static err_t on_accept(struct eth_fg *cur_fg, void *arg, struct tcp_pcb *pcb, er
 	api->id = id;
 	handle = tcpapi_to_handle(cur_fg, api);
 	api->handle = handle;
-	id = (struct ip_tuple *)
-	     mempool_pagemem_to_iomap(&percpu_get(id_mempool), id);
 
 #if CONFIG_PRINT_CONNECTION_COUNT
 	print_conn(1);
 #endif
 
-	usys_tcp_knock(handle, id);
+	spin_lock(&percpu_get(pcb_ready_queue).lock);
+	api->uevents |= PCB_UEVENT_KNOCK;
+	pcb_ready_enqueue(api);
+	spin_unlock(&percpu_get(pcb_ready_queue).lock);
+
 	return ERR_OK;
 }
 
@@ -526,7 +819,11 @@ static err_t on_connected(void *arg, struct tcp_pcb *pcb, err_t err)
 		return err;
 	}
 
-	usys_tcp_connected(api->handle, api->cookie, RET_OK);
+	spin_lock(&percpu_get(pcb_ready_queue).lock);
+	api->uevents |= PCB_UEVENT_CONNECTED;
+	pcb_ready_enqueue(api);
+	spin_unlock(&percpu_get(pcb_ready_queue).lock);
+
 	return ERR_OK;
 }
 
@@ -735,6 +1032,13 @@ long bsys_tcp_connect(struct ip_tuple __user *id, unsigned long cookie)
 	api->recvd = NULL;
 	api->recvd_tail = NULL;
 	api->accepted = true;
+	api->sent_len = 0;
+	api->len_xmited = 0;
+	init_queue(&api->pbuf_for_usys);
+	init_queue_node(&api->ready_queue);
+	api->active_usys_count = 0;
+	api->uevents = 0;
+	api->flags = 0;
 
 	tcp_arg(pcb, api);
 
@@ -873,6 +1177,8 @@ int tcp_api_init_cpu(void)
 #if CONFIG_PRINT_CONNECTION_COUNT
 	timer_init_entry(&percpu_get(print_conn_timer), __print_conn);
 #endif
+
+	srand48_r(rdtsc(), &percpu_get(drand48_data));
 
 	return 0;
 }

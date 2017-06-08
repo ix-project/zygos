@@ -4,7 +4,8 @@
 #include <ix/cpu.h>
 
 #define STATS \
-	COUNTER(llc_load_misses)
+	COUNTER(llc_load_misses) \
+	COUNTER(steals)
 
 #if CONFIG_STATS
 

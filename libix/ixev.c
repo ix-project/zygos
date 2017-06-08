@@ -568,6 +568,9 @@ static void ixev_handle_one_ret(struct bsys_ret *r)
 		ixev_handle_close_ret(ctx, ret);
 		break;
 
+	case KSYS_NOP:
+		break;
+
 	default:
 		if (unlikely(ret))
 			ixev_bad_ret(ctx, sysnr, ret);

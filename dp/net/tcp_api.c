@@ -272,10 +272,12 @@ ssize_t bsys_tcp_sendv(hid_t handle, struct sg_entry __user *ents,
 			break;
 	}
 
-	if (len_xmited)
+	if (len_xmited) {
 		tcp_output(cur_fg, api->pcb);
+		usys_tcp_sendv_ret(api->handle, api->cookie, len_xmited);
+	}
 
-	return len_xmited;
+	return 0;
 }
 
 long bsys_tcp_recv_done(hid_t handle, size_t len)

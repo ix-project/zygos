@@ -46,6 +46,8 @@ static struct ixev_conn_ops ixev_global_ops;
 static struct mempool_datastore ixev_buf_datastore;
 __thread struct mempool ixev_buf_pool;
 
+static void ixev_tcp_sendv_ret(hid_t handle, unsigned long cookie, size_t len);
+
 static inline void __ixev_check_generation(struct ixev_ctx *ctx)
 {
 	if (ixev_generation != ctx->generation || tid != ctx->tid) {
@@ -207,6 +209,7 @@ static struct ix_ops ixev_ops = {
 	.tcp_recv	= ixev_tcp_recv,
 	.tcp_sent	= ixev_tcp_sent,
 	.timer_event	= ixev_timer_event,
+	.tcp_sendv_ret  = ixev_tcp_sendv_ret,
 };
 
 /**
@@ -496,22 +499,24 @@ static void ixev_shift_sends(struct ixev_ctx *ctx, int shift)
 
 static void ixev_handle_sendv_ret(struct ixev_ctx *ctx, long ret)
 {
-	int i;
-
-	if (ret < 0) {
+	if (ret < 0)
 		ctx->is_dead = true;
-		return;
-	}
+}
+
+static void ixev_tcp_sendv_ret(hid_t handle, unsigned long cookie, size_t len)
+{
+	int i;
+	struct ixev_ctx *ctx = (struct ixev_ctx *) cookie;
 
 	for (i = 0; i < ctx->send_count; i++) {
 		struct sg_entry *ent = &ctx->send[i];
-		if (ret < ent->len) {
-			ent->len -= ret;
-			ent->base = (char *) ent->base + ret;
+		if (len < ent->len) {
+			ent->len -= len;
+			ent->base = (char *) ent->base + len;
 			break;
 		}
 
-		ret -= ent->len;
+		len -= ent->len;
 	}
 
 	ixev_shift_sends(ctx, i);

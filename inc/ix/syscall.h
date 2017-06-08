@@ -324,6 +324,7 @@ enum {
 	USYS_TCP_SENT,
 	USYS_TCP_DEAD,
 	USYS_TIMER,
+	USYS_TCP_SENDV_RET,
 	USYS_NR,
 };
 
@@ -458,6 +459,13 @@ usys_timer(unsigned long cookie)
 {
 	struct bsys_desc *d = usys_next();
 	BSYS_DESC_1ARG(d, USYS_TIMER, cookie);
+}
+
+static inline void
+usys_tcp_sendv_ret(hid_t handle, unsigned long cookie, size_t len)
+{
+	struct bsys_desc *d = usys_next();
+	BSYS_DESC_3ARG(d, USYS_TCP_SENDV_RET, handle, cookie, len);
 }
 
 /*

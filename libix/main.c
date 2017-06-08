@@ -112,6 +112,7 @@ int ix_init(struct ix_ops *ops, int batch_depth)
 	usys_tbl[USYS_TCP_SENT]		= (bsysfn_t) ops->tcp_sent;
 	usys_tbl[USYS_TCP_DEAD]		= (bsysfn_t) ops->tcp_dead;
 	usys_tbl[USYS_TIMER]		= (bsysfn_t) ops->timer_event;
+	usys_tbl[USYS_TCP_SENDV_RET]	= (bsysfn_t) ops->tcp_sendv_ret;
 
 	/* provide sane defaults so we don't leak memory */
 	if (!ops->udp_recv)

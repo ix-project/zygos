@@ -135,6 +135,28 @@ static int bsys_dispatch(struct bsys_desc __user *d, unsigned int nr)
 	return 0;
 }
 
+static DEFINE_PERCPU(struct bsys_arr *, ksys_local);
+
+void bsys_dispatch_remote(void)
+{
+	unsigned int remote_nr;
+	int ret;
+	struct bsys_arr *ksys;
+
+	ksys = percpu_get(ksys_local);
+	spin_lock(&percpu_get(ksys_remote).lock);
+	remote_nr = percpu_get(ksys_remote).len;
+	assert(remote_nr + ksys->len < ksys->max_len);
+	memcpy(&ksys->descs[ksys->len], percpu_get(ksys_remote).descs, remote_nr * sizeof(struct bsys_desc));
+	percpu_get(ksys_remote).len = 0;
+	spin_unlock(&percpu_get(ksys_remote).lock);
+
+	ret = bsys_dispatch(&ksys->descs[ksys->len], remote_nr);
+	assert(!ret);
+
+	ksys->len += remote_nr;
+}
+
 /**
  * sys_bpoll - performs I/O processing and issues a batch of system calls
  * @d: the batched system call descriptor array
@@ -146,9 +168,21 @@ static int sys_bpoll(struct bsys_desc __user *d, unsigned int nr)
 {
 	int ret = 0, empty;
 
+	percpu_get(in_kernel) = true;
+
+	percpu_get(ksys_local) = container_of(d, struct bsys_arr, descs[0]);
+
+	for (int i = 0; i < nr; i++)
+		log_desc("from userspace", i, false, false, &d[i]);
+	for (int i = 0; i < percpu_get(usys_arr)->len; i++)
+		log_desc("from userspace", i, true, true, &percpu_get(usys_arr)->descs[i]);
 
 	KSTATS_PUSH(tx_reclaim, NULL);
 	eth_process_reclaim();
+	KSTATS_POP(NULL);
+
+	KSTATS_PUSH(tcp_route_ksys, NULL);
+	tcp_route_ksys(d, nr);
 	KSTATS_POP(NULL);
 
 	KSTATS_PUSH(bsys, NULL);
@@ -216,7 +250,7 @@ again:
 	tcp_generate_usys();
 	KSTATS_POP(NULL);
 
-	if (!nr && !percpu_get(usys_arr)->len) {
+	if (!percpu_get(ksys_local)->len && !percpu_get(usys_arr)->len) {
 		/* Do not idle if control plane sets the no_idle flag. */
 		if (empty && !percpu_get(cp_cmd)->no_idle) {
 			uint64_t deadline = timer_deadline(10 * ONE_MS);
@@ -225,7 +259,7 @@ again:
 				KSTATS_PUSH(idle, NULL);
 
 				start = rdtsc();
-				eth_rx_idle_wait(deadline);
+				tcp_steal_idle_wait(deadline);
 				percpu_get(idle_cycles) += rdtsc() - start;
 				KSTATS_POP(NULL);
 			}
@@ -239,6 +273,12 @@ again:
 	}
 
 out:
+	for (int i = 0; i < percpu_get(ksys_local)->len; i++)
+		log_desc("to userspace", i, false, true, &d[i]);
+	for (int i = 0; i < percpu_get(usys_arr)->len; i++)
+		log_desc("to userspace", i, true, false, &percpu_get(usys_arr)->descs[i]);
+
+	percpu_get(in_kernel) = false;
 	return ret;
 }
 

@@ -344,6 +344,7 @@ struct locked_bsys_arr {
 
 DECLARE_PERCPU(bool, in_kernel);
 DECLARE_PERCPU(struct locked_bsys_arr, ksys_remote);
+void bsys_dispatch_remote(void);
 
 /**
  * usys_reset - reset the batched call array

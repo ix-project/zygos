@@ -45,7 +45,7 @@ int nr_flow_groups;
 struct eth_fg *fgs[ETH_MAX_TOTAL_FG + NCPU];
 
 
-struct queue {
+struct mbuf_queue {
 	struct mbuf *head;
 	struct mbuf *tail;
 };
@@ -57,8 +57,8 @@ struct migration_info {
 	DEFINE_BITMAP(fg_bitmap, ETH_MAX_TOTAL_FG);
 };
 
-DEFINE_PERCPU(struct queue, local_mbuf_queue);
-DEFINE_PERCPU(struct queue, remote_mbuf_queue);
+DEFINE_PERCPU(struct mbuf_queue, local_mbuf_queue);
+DEFINE_PERCPU(struct mbuf_queue, remote_mbuf_queue);
 DEFINE_PERCPU(struct hlist_head, remote_timers_list);
 DEFINE_PERCPU(uint64_t, remote_timer_pos);
 DEFINE_PERCPU(struct migration_info, migration_info);
@@ -68,7 +68,7 @@ static void transition_handler_target(void *fg_);
 static void migrate_pkts_to_remote(struct eth_fg *fg);
 static void migrate_timers_to_remote(int fg_id);
 static void migrate_timers_from_remote(void);
-static void enqueue(struct queue *q, struct mbuf *pkt);
+static void enqueue(struct mbuf_queue *q, struct mbuf *pkt);
 
 int init_migration_cpu(void)
 {
@@ -363,7 +363,7 @@ static struct eth_rx_queue *queue_from_fg(struct eth_fg *fg)
 static void transition_handler_target(void *info_)
 {
 	struct mbuf *pkt, *next;
-	struct queue *q;
+	struct mbuf_queue *q;
 	struct migration_info *info = (struct migration_info *) info_;
 	struct eth_fg *fg;
 	int prev_cpu = info->prev_cpu;
@@ -435,7 +435,7 @@ static void migrate_pkts_to_remote(struct eth_fg *fg)
 	struct eth_rx_queue *rxq = queue_from_fg(fg);
 	struct mbuf *pkt = rxq->head;
 	struct mbuf **prv = &rxq->head;
-	struct queue *q = &percpu_get_remote(remote_mbuf_queue, fg->target_cpu);
+	struct mbuf_queue *q = &percpu_get_remote(remote_mbuf_queue, fg->target_cpu);
 
 	while (pkt) {
 		if (fg->fg_id == pkt->fg_id) {
@@ -451,7 +451,7 @@ static void migrate_pkts_to_remote(struct eth_fg *fg)
 	rxq->tail = container_of(prv, struct mbuf, next);
 }
 
-static void enqueue(struct queue *q, struct mbuf *pkt)
+static void enqueue(struct mbuf_queue *q, struct mbuf *pkt)
 {
 	pkt->next = NULL;
 	if (!q->head) {
@@ -473,7 +473,7 @@ void eth_recv_at_prev(struct eth_rx_queue *rx_queue, struct mbuf *pkt)
 	}
 
 	struct eth_fg *fg = fgs[pkt->fg_id];
-	struct queue *q = &percpu_get_remote(remote_mbuf_queue, fg->target_cpu);
+	struct mbuf_queue *q = &percpu_get_remote(remote_mbuf_queue, fg->target_cpu);
 	enqueue(q, pkt);
 }
 
@@ -486,7 +486,7 @@ void eth_recv_at_target(struct eth_rx_queue *rx_queue, struct mbuf *pkt)
 		SCRATCHPAD->ts_last_pkt_at_target = rdtsc();
 	}
 
-	struct queue *q = &percpu_get(local_mbuf_queue);
+	struct mbuf_queue *q = &percpu_get(local_mbuf_queue);
 	if (!q->head) {
 		/*
 		 * When we receive the first packet on the target CPU, we cause

@@ -44,6 +44,7 @@
 #include <ix/ethfg.h>
 #include <ix/utimer.h>
 #include <ix/stats.h>
+#include <ix/debug_desc.h>
 
 #include <dune.h>
 
@@ -428,6 +429,9 @@ int syscall_init_cpu(void)
 
 	percpu_get(usys_arr) = arr;
 	percpu_get(usys_iomap) = iomap;
+
+	debug_desc_init();
+
 	return 0;
 }
 

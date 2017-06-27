@@ -27,9 +27,11 @@
 
 #define _GNU_SOURCE
 
+#include <assert.h>
 #include <unistd.h>
 #include <sched.h>
 #include <sys/syscall.h>
+#include <stdio.h>
 
 #include <ix/stddef.h>
 #include <ix/errno.h>
@@ -44,6 +46,7 @@ int cpus_active;
 DEFINE_PERCPU(unsigned int, cpu_numa_node);
 DEFINE_PERCPU(unsigned int, cpu_id);
 DEFINE_PERCPU(unsigned int, cpu_nr);
+DEFINE_PERCPU(unsigned int, apicid);
 
 void *percpu_offsets[NCPU];
 
@@ -63,6 +66,11 @@ struct cpu_runlist {
 	spinlock_t lock;
 	struct cpu_runner *next_runner;
 } __aligned(CACHE_LINE_SIZE);
+
+static struct apicid_map {
+	int processor;
+	int apicid;
+} apicid_map[NCPU];
 
 static DEFINE_PERCPU(struct cpu_runlist, runlist);
 
@@ -163,7 +171,7 @@ static void *cpu_init_percpu(unsigned int cpu, unsigned int numa_node)
  */
 int cpu_init_one(unsigned int cpu)
 {
-	int ret;
+	int ret, i;
 	cpu_set_t mask;
 	unsigned int tmp, numa_node;
 	void *pcpu;
@@ -198,6 +206,11 @@ int cpu_init_one(unsigned int cpu)
 
 	percpu_get(cpu_id) = cpu;
 	percpu_get(cpu_numa_node) = numa_node;
+	for (i = 0; i < NCPU; i++)
+		if (apicid_map[i].processor == cpu)
+			break;
+	assert(i < NCPU);
+	percpu_get(apicid) = apicid_map[i].apicid;
 	log_is_early_boot = false;
 
 	ret = mempool_create(&percpu_get(runners_mempool), &runners_datastore,
@@ -205,9 +218,53 @@ int cpu_init_one(unsigned int cpu)
 	if (ret)
 		return ret;
 
-	log_info("cpu: started core %d, numa node %d\n", cpu, numa_node);
+	log_info("cpu: started core %d, numa node %d, apicid %d\n", cpu, numa_node, percpu_get(apicid));
 
 	return 0;
+}
+
+static int parse_cpuinfo(void)
+{
+	int ret = 0, processor, apicid, count = 0, tokens;
+	FILE *f;
+	char buf[BUFSIZ];
+
+	f = fopen("/proc/cpuinfo", "r");
+	if (!f)
+		return -EIO;
+
+	while (true) {
+		if (!fgets(buf, sizeof(buf), f)) {
+			if (feof(f))
+				break;
+			ret = -EIO;
+			goto out;
+		}
+
+		if (!strncmp(buf, "processor", strlen("processor"))) {
+			tokens = sscanf(buf, "%*s : %d", &processor);
+			if (tokens != 1) {
+				ret = -EIO;
+				goto out;
+			}
+		}
+
+		if (!strncmp(buf, "apicid", strlen("apicid"))) {
+			tokens = sscanf(buf, "%*s : %d", &apicid);
+			if (tokens != 1) {
+				ret = -EIO;
+				goto out;
+			}
+
+			apicid_map[count].processor = processor;
+			apicid_map[count].apicid = apicid;
+			count++;
+		}
+	}
+
+out:
+	fclose(f);
+	return ret;
 }
 
 /**
@@ -229,6 +286,10 @@ int cpu_init(void)
 	ret = mempool_create_datastore(&runners_datastore, MAX_RUNNERS,
 		sizeof(struct cpu_runner), 0, MEMPOOL_DEFAULT_CHUNKSIZE,
 		"runners");
+	if (ret)
+		return ret;
+
+	ret = parse_cpuinfo();
 	if (ret)
 		return ret;
 

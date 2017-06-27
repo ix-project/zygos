@@ -113,6 +113,7 @@ static inline unsigned int __cpu_next_active(unsigned int cpu)
 DECLARE_PERCPU(unsigned int, cpu_numa_node);
 DECLARE_PERCPU(unsigned int, cpu_id);
 DECLARE_PERCPU(unsigned int, cpu_nr);
+DECLARE_PERCPU(unsigned int, apicid);
 
 extern void cpu_do_bookkeeping(void);
 

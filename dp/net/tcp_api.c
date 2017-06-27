@@ -37,6 +37,8 @@
 #include <ix/config.h>
 #include <ix/stats.h>
 #include <ix/queue.h>
+#include <dune.h>
+#include <ix/apic.h>
 
 #include <lwip/tcp.h>
 
@@ -56,6 +58,16 @@ static DEFINE_PERCPU(uint16_t, local_port);
 
 static DEFINE_PERCPU(int, open_connections);
 static DEFINE_PERCPU(struct timer, print_conn_timer);
+
+#endif
+
+#if CONFIG_RUN_TCP_STACK_IPI
+
+static DEFINE_PERCPU(long, last_ipi_time);
+
+#define IPI_TIMEOUT (4 * cycles_per_us)
+
+#define RUN_TCP_STACK_IPI_VECTOR 0xf2
 
 #endif
 
@@ -349,6 +361,62 @@ void tcp_generate_usys(void)
 	}
 }
 
+#if CONFIG_RUN_TCP_STACK_IPI
+
+static void run_tcp_stack_ipi_handler(struct dune_tf *tf)
+{
+	char fxsave[512];
+
+	if (percpu_get(in_kernel))
+		goto out;
+
+	asm volatile("fxsave %0" : "=m" (fxsave));
+
+	eth_process_poll();
+
+	eth_process_recv();
+
+	asm volatile("fxrstor %0" : "=m" (fxsave));
+
+out:
+	apic_eoi();
+	percpu_get(last_ipi_time) = 0;
+}
+
+#endif
+
+#if CONFIG_RUN_TCP_STACK_IPI
+
+static void tcp_steal_ipi_send(void)
+{
+	int count = 0, cpu_id, i;
+	long rnd, last, now;
+	struct eth_rx_queue *rxq;
+	unsigned char cpus[NCPU];
+
+	now = rdtsc();
+	for (i = 0; i < CFG.num_cpus; i++) {
+		if (percpu_get_remote(in_kernel, CFG.cpu[i]))
+			continue;
+		last = percpu_get_remote(last_ipi_time, CFG.cpu[i]);
+		if (last && now - last < IPI_TIMEOUT)
+			continue;
+		rxq = percpu_get_remote(eth_rxqs[0], CFG.cpu[i]);
+		if (rxq->ready(rxq))
+			cpus[count++] = CFG.cpu[i];
+	}
+
+	if (count) {
+		lrand48_r(&percpu_get(drand48_data), &rnd);
+		cpu_id = cpus[rnd % count];
+
+		percpu_get_remote(last_ipi_time, cpu_id) = now;
+		apic_send_ipi(cpu_id, RUN_TCP_STACK_IPI_VECTOR);
+	}
+}
+
+#endif
+
 void tcp_steal_idle_wait(uint64_t usecs)
 {
 	int count, cpu_id, i, ok = 0;
@@ -416,6 +484,10 @@ void tcp_steal_idle_wait(uint64_t usecs)
 #endif
 				return;
 			}
+		} else {
+#if CONFIG_RUN_TCP_STACK_IPI
+			tcp_steal_ipi_send();
+#endif
 		}
 		cpu_relax();
 	} while (rdtsc() < deadline);
@@ -1192,6 +1264,11 @@ int tcp_api_init_cpu(void)
 #endif
 
 	srand48_r(rdtsc(), &percpu_get(drand48_data));
+
+#if CONFIG_RUN_TCP_STACK_IPI
+	dune_register_intr_handler(RUN_TCP_STACK_IPI_VECTOR, run_tcp_stack_ipi_handler);
+	dune_control_guest_ints(true);
+#endif
 
 	return 0;
 }

@@ -107,18 +107,13 @@ static int bsys_dispatch_one(struct bsys_desc __user *d)
 	return 0;
 }
 
-static int bsys_dispatch(struct bsys_desc __user *d, unsigned int nr)
+static int __bsys_dispatch(struct bsys_desc __user *d, unsigned int nr)
 {
 	unsigned long i;
 	int ret;
 #ifdef ENABLE_KSTATS
 	kstats_accumulate save;
 #endif
-
-	if (!nr)
-		return 0;
-	if (unlikely(!uaccess_okay(d, sizeof(struct bsys_desc) * nr)))
-		return -EFAULT;
 
 	for (i = 0; i < nr; i++) {
 		KSTATS_PUSH(bsys_dispatch_one, &save);
@@ -131,26 +126,29 @@ static int bsys_dispatch(struct bsys_desc __user *d, unsigned int nr)
 	return 0;
 }
 
+static int bsys_dispatch(struct bsys_desc __user *d, unsigned int nr)
+{
+	if (!nr)
+		return 0;
+	if (unlikely(!uaccess_okay(d, sizeof(struct bsys_desc) * nr)))
+		return -EFAULT;
+
+	return __bsys_dispatch(d, nr);
+}
+
 static DEFINE_PERCPU(struct bsys_arr *, ksys_local);
 
 void bsys_dispatch_remote(void)
 {
 	unsigned int remote_nr;
 	int ret;
-	struct bsys_arr *ksys;
 
-	ksys = percpu_get(ksys_local);
 	spin_lock(&percpu_get(ksys_remote).lock);
 	remote_nr = percpu_get(ksys_remote).len;
-	assert(remote_nr + ksys->len < ksys->max_len);
-	memcpy(&ksys->descs[ksys->len], percpu_get(ksys_remote).descs, remote_nr * sizeof(struct bsys_desc));
+	ret = __bsys_dispatch(percpu_get(ksys_remote).descs, remote_nr);
+	assert(!ret);
 	percpu_get(ksys_remote).len = 0;
 	spin_unlock(&percpu_get(ksys_remote).lock);
-
-	ret = bsys_dispatch(&ksys->descs[ksys->len], remote_nr);
-	assert(!ret);
-
-	ksys->len += remote_nr;
 }
 
 /**

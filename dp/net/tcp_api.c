@@ -334,9 +334,12 @@ static void __tcp_finish_usys(void *_api)
 
 void tcp_finish_usys(void)
 {
-	int i, home;
+	int i, home, ret;
 	struct tcpapi_pcb *api;
 	struct bsys_desc *descs = percpu_get(usys_arr)->descs;
+#if CONFIG_RUN_TCP_STACK_IPI
+	long now, last;
+#endif
 
 	for (i = 0; i < percpu_get(usys_arr)->len; i++) {
 		if (!usys_is_tcp(&descs[i]))
@@ -345,10 +348,21 @@ void tcp_finish_usys(void)
 		api = __handle_to_tcpapi(descs[i].arga);
 
 		home = bsys_tcp_home_id(&descs[i]);
-		if (home == percpu_get(cpu_id))
+		if (home == percpu_get(cpu_id)) {
 			__tcp_finish_usys(api);
-		else
-			cpu_run_on_one(__tcp_finish_usys, api, home);
+		} else {
+			ret = cpu_run_on_one(__tcp_finish_usys, api, home);
+			assert(!ret);
+#if CONFIG_RUN_TCP_STACK_IPI
+			/* Send an IPI in case the home core is in userspace */
+			now = rdtsc();
+			last = percpu_get_remote(last_ipi_time, home);
+			if (!last || now - last >= IPI_TIMEOUT) {
+				percpu_get_remote(last_ipi_time, home) = now;
+				apic_send_ipi(home, RUN_TCP_STACK_IPI_VECTOR);
+			}
+#endif
+		}
 	}
 }
 
@@ -381,9 +395,14 @@ static void run_tcp_stack_ipi_handler(struct dune_tf *tf)
 
 	asm volatile("fxsave %0" : "=m" (fxsave));
 
+	/* Needed so that we process remote ksys */
+	cpu_do_bookkeeping();
+
 	eth_process_poll();
 
 	eth_process_recv();
+
+	eth_process_send();
 
 	asm volatile("fxrstor %0" : "=m" (fxsave));
 

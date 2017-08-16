@@ -156,7 +156,7 @@ static int udp_output(struct mbuf *__restrict pkt,
  *
  * Returns the number of bytes sent, or < 0 if fail.
  */
-long bsys_udp_send(void __user *__restrict vaddr, size_t len,
+void bsys_udp_send(void __user *__restrict vaddr, size_t len,
 		   struct ip_tuple __user *__restrict id,
 		   unsigned long cookie)
 {
@@ -171,24 +171,34 @@ long bsys_udp_send(void __user *__restrict vaddr, size_t len,
 	KSTATS_VECTOR(bsys_udp_send);
 
 	/* validate user input */
-	if (unlikely(len > UDP_MAX_LEN))
-		return -RET_INVAL;
+	if (unlikely(len > UDP_MAX_LEN)) {
+		usys_ksys_ret(KSYS_UDP_SEND, -RET_INVAL, 0);
+		return;
+	}
 
-	if (unlikely(copy_from_user(id, &tmp, sizeof(struct ip_tuple))))
-		return -RET_FAULT;
+	if (unlikely(copy_from_user(id, &tmp, sizeof(struct ip_tuple)))) {
+		usys_ksys_ret(KSYS_UDP_SEND, -RET_FAULT, 0);
+		return;
+	}
 
-	if (unlikely(!uaccess_zc_okay(vaddr, len)))
-		return -RET_FAULT;
+	if (unlikely(!uaccess_zc_okay(vaddr, len))) {
+		usys_ksys_ret(KSYS_UDP_SEND, -RET_FAULT, 0);
+		return;
+	}
 
 	addr = (void *) vm_lookup_phys(vaddr, PGSIZE_2MB);
-	if (unlikely(!addr))
-		return -RET_FAULT;
+	if (unlikely(!addr)) {
+		usys_ksys_ret(KSYS_UDP_SEND, -RET_FAULT, 0);
+		return;
+	}
 
 	addr = (void *)((uintptr_t) addr + PGOFF_2MB(vaddr));
 
 	pkt = mbuf_alloc_local();
-	if (unlikely(!pkt))
-		return -RET_NOBUFS;
+	if (unlikely(!pkt)) {
+		usys_ksys_ret(KSYS_UDP_SEND, -RET_NOBUFS, 0);
+		return;
+	}
 
 	iovs = mbuf_mtod_off(pkt, struct mbuf_iov *,
 			     align_up(UDP_PKT_SIZE, sizeof(uint64_t)));
@@ -220,18 +230,17 @@ long bsys_udp_send(void __user *__restrict vaddr, size_t len,
 		for (i = 0; i < pkt->nr_iov; i++)
 			mbuf_iov_free(&pkt->iovs[i]);
 		mbuf_free(pkt);
-		return ret;
+		usys_ksys_ret(KSYS_UDP_SEND, ret, 0);
+		return;
 	}
-
-	return 0;
 }
 
-long bsys_udp_sendv(struct sg_entry __user *ents, unsigned int nrents,
+void bsys_udp_sendv(struct sg_entry __user *ents, unsigned int nrents,
 		    struct ip_tuple __user *id, unsigned long cookie)
 {
 	KSTATS_VECTOR(bsys_udp_sendv);
 
-	return -RET_NOSYS;
+	usys_ksys_ret(KSYS_UDP_SENDV, -RET_NOSYS, 0);
 }
 
 #define MAX_MBUF_PAGE_OFF	(PGSIZE_2MB - (PGSIZE_2MB % MBUF_LEN))
@@ -240,7 +249,7 @@ long bsys_udp_sendv(struct sg_entry __user *ents, unsigned int nrents,
  * bsys_udp_recv_done - inform the kernel done using a UDP packet buffer
  * @iomap: a pointer anywhere inside the mbuf
  */
-long bsys_udp_recv_done(void *iomap)
+void bsys_udp_recv_done(void *iomap)
 {
 	struct mempool *pool = &percpu_get(mbuf_mempool);
 	struct mbuf *m;
@@ -272,11 +281,11 @@ long bsys_udp_recv_done(void *iomap)
 
 	if (unlikely(m->done != (void *) 0xDEADBEEF)) {
 		log_err("udp: user tried to free an already free mbuf\n");
-		return -RET_INVAL;
+		usys_ksys_ret(KSYS_UDP_RECV_DONE, -RET_INVAL, 0);
+		return;
 	}
 
 	m->done = NULL;
 	mbuf_free(m);
-	return 0;
 }
 

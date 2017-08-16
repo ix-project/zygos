@@ -90,7 +90,7 @@ enum {
  * Batched system calls
  */
 
-typedef long(*bsysfn_t)(uint64_t, uint64_t, uint64_t, uint64_t);
+typedef void(*bsysfn_t)(uint64_t, uint64_t, uint64_t, uint64_t);
 
 /*
  * batched system call descriptor format:
@@ -101,13 +101,6 @@ typedef long(*bsysfn_t)(uint64_t, uint64_t, uint64_t, uint64_t);
 struct bsys_desc {
 	uint64_t sysnr;
 	uint64_t arga, argb, argc, argd;
-} __packed;
-
-struct bsys_ret {
-	uint64_t sysnr;
-	uint64_t cookie;
-	long ret;
-	uint64_t pad[2];
 } __packed;
 
 #define BSYS_DESC_NOARG(desc, vsysnr) \
@@ -326,6 +319,7 @@ enum {
 	USYS_TCP_DEAD,
 	USYS_TIMER,
 	USYS_TCP_SENDV_RET,
+	USYS_KSYS_RET,
 	USYS_NR,
 };
 
@@ -364,6 +358,12 @@ static inline void usys_reset(void)
 static inline struct bsys_desc *usys_next(void)
 {
 	return __bsys_arr_next(percpu_get(usys_arr));
+}
+
+static inline void usys_ksys_ret(uint64_t sysnr, long err, unsigned long cookie)
+{
+	struct bsys_desc *d = usys_next();
+	BSYS_DESC_3ARG(d, USYS_KSYS_RET, sysnr, err, cookie);
 }
 
 /**
@@ -488,24 +488,24 @@ usys_tcp_sendv_ret(hid_t handle, unsigned long cookie, size_t len)
 /* FIXME: could use Sparse to statically check */
 #define __user
 
-extern long bsys_udp_send(void __user *addr, size_t len,
+extern void bsys_udp_send(void __user *addr, size_t len,
 			  struct ip_tuple __user *id,
 			  unsigned long cookie);
-extern long bsys_udp_sendv(struct sg_entry __user *ents,
+extern void bsys_udp_sendv(struct sg_entry __user *ents,
 			   unsigned int nrents,
 			   struct ip_tuple __user *id,
 			   unsigned long cookie);
-extern long bsys_udp_recv_done(void *iomap);
+extern void bsys_udp_recv_done(void *iomap);
 
-extern long bsys_tcp_connect(struct ip_tuple __user *id,
+extern void bsys_tcp_connect(struct ip_tuple __user *id,
 			     unsigned long cookie);
-extern long bsys_tcp_accept(hid_t handle, unsigned long cookie);
-extern long bsys_tcp_reject(hid_t handle);
-extern ssize_t bsys_tcp_send(hid_t handle, void *addr, size_t len);
-extern ssize_t bsys_tcp_sendv(hid_t handle, struct sg_entry __user *ents,
+extern void bsys_tcp_accept(hid_t handle, unsigned long cookie);
+extern void bsys_tcp_reject(hid_t handle);
+extern void bsys_tcp_send(hid_t handle, void *addr, size_t len);
+extern void bsys_tcp_sendv(hid_t handle, struct sg_entry __user *ents,
 			      unsigned int nrents);
-extern long bsys_tcp_recv_done(hid_t handle, size_t len);
-extern long bsys_tcp_close(hid_t handle);
+extern void bsys_tcp_recv_done(hid_t handle, size_t len);
+extern void bsys_tcp_close(hid_t handle);
 
 struct dune_tf;
 extern void do_syscall(struct dune_tf *tf, uint64_t sysnr);

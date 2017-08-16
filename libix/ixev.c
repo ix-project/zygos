@@ -46,6 +46,7 @@ static struct ixev_conn_ops ixev_global_ops;
 static struct mempool_datastore ixev_buf_datastore;
 __thread struct mempool ixev_buf_pool;
 
+static void ixev_ksys_ret(uint64_t sysnr, long ret, unsigned long cookie);
 static void ixev_tcp_sendv_ret(hid_t handle, unsigned long cookie, size_t len);
 
 static inline void __ixev_check_generation(struct ixev_ctx *ctx)
@@ -210,6 +211,7 @@ static struct ix_ops ixev_ops = {
 	.tcp_sent	= ixev_tcp_sent,
 	.timer_event	= ixev_timer_event,
 	.tcp_sendv_ret  = ixev_tcp_sendv_ret,
+	.ksys_ret	= ixev_ksys_ret,
 };
 
 /**
@@ -539,11 +541,9 @@ static void ixev_handle_close_ret(struct ixev_ctx *ctx, long ret)
 	ixev_global_ops.release(ctx);
 }
 
-static void ixev_handle_one_ret(struct bsys_ret *r)
+static void ixev_ksys_ret(uint64_t sysnr, long ret, unsigned long cookie)
 {
-	struct ixev_ctx *ctx = (struct ixev_ctx *) r->cookie;
-	uint64_t sysnr = r->sysnr;
-	long ret = r->ret;
+	struct ixev_ctx *ctx = (struct ixev_ctx *) cookie;
 
 	switch (sysnr) {
 	case KSYS_TCP_CONNECT:
@@ -582,8 +582,6 @@ static void ixev_handle_one_ret(struct bsys_ret *r)
  */
 void ixev_wait(void)
 {
-	int i;
-
 	/*
 	 * FIXME: don't use the low-level library,
 	 * just make system calls directly.
@@ -592,9 +590,6 @@ void ixev_wait(void)
 	ix_poll();
 	ixev_generation++;
 
-	/* WARNING: return handlers should not enqueue new comamnds */
-	for (i = 0; i < karr->len; i++)
-		ixev_handle_one_ret((struct bsys_ret *) &karr->descs[i]);
 	karr->len = 0;
 
 	ix_handle_events();

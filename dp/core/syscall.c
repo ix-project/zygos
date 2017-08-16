@@ -53,7 +53,6 @@
 
 DEFINE_PERCPU(struct bsys_arr *, usys_arr);
 DEFINE_PERCPU(void *, usys_iomap);
-DEFINE_PERCPU(unsigned long, syscall_cookie);
 DEFINE_PERCPU(unsigned long, idle_cycles);
 
 // TODO: make struct with volatile field
@@ -88,7 +87,7 @@ static bsysfn_t bsys_tbl[] = {
 
 static int bsys_dispatch_one(struct bsys_desc __user *d)
 {
-	uint64_t sysnr, arga, argb, argc, argd, ret;
+	uint64_t sysnr, arga, argb, argc, argd;
 
 	sysnr = uaccess_peekq(&d->sysnr);
 	arga = uaccess_peekq(&d->arga);
@@ -99,18 +98,11 @@ static int bsys_dispatch_one(struct bsys_desc __user *d)
 	if (unlikely(uaccess_check_fault()))
 		return -EFAULT;
 	if (unlikely(sysnr >= KSYS_NR)) {
-		ret = (uint64_t) - ENOSYS;
-		goto out;
+		usys_ksys_ret(sysnr, -ENOSYS, 0);
+		return 0;
 	}
 
-	ret = bsys_tbl[sysnr](arga, argb, argc, argd);
-
-out:
-	arga = percpu_get(syscall_cookie);
-	uaccess_pokeq(&d->arga, arga);
-	uaccess_pokeq(&d->argb, ret);
-	if (unlikely(uaccess_check_fault()))
-		return -EFAULT;
+	bsys_tbl[sysnr](arga, argb, argc, argd);
 
 	return 0;
 }

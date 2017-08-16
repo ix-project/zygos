@@ -96,6 +96,10 @@ struct tcpapi_pcb {
 	int active_usys_count;
 	char uevents;
 	char flags;
+	struct {
+		uint64_t sysnr;
+		long err;
+	} lasterr;
 };
 
 #define PCB_UEVENT_KNOCK 1
@@ -153,8 +157,6 @@ static inline struct tcpapi_pcb *handle_to_tcpapi(hid_t handle, struct eth_fg **
 	/* check if the handle is actually allocated */
 	if (unlikely(api->alive > 1))
 		return NULL;
-
-	percpu_get(syscall_cookie) = api->cookie;
 
 	return api;
 }
@@ -243,6 +245,13 @@ static void __tcp_gen_usys(struct tcpapi_pcb *api)
 	if (!api->alive) {
 		log_debug("%lx: usys_tcp_dead(%lx, %lx)\n", api, api->handle, api->cookie);
 		usys_tcp_dead(api->handle, api->cookie);
+		api->active_usys_count++;
+	}
+
+	if (api->lasterr.sysnr) {
+		usys_ksys_ret(api->lasterr.sysnr, api->lasterr.err, api->cookie);
+		api->lasterr.sysnr = 0;
+		api->lasterr.err = 0;
 		api->active_usys_count++;
 	}
 }
@@ -504,7 +513,7 @@ static void recv_a_pbuf(struct tcpapi_pcb *api, struct pbuf *p)
 	spin_unlock(&percpu_get(pcb_ready_queue).lock);
 }
 
-long bsys_tcp_accept(hid_t handle, unsigned long cookie)
+void bsys_tcp_accept(hid_t handle, unsigned long cookie)
 {
 	/*
 	 * FIXME: this function is sort of a placeholder since we have no
@@ -523,7 +532,8 @@ long bsys_tcp_accept(hid_t handle, unsigned long cookie)
 
 	if (unlikely(!api)) {
 		log_debug("tcpapi: invalid handle\n");
-		return -RET_BADH;
+		usys_ksys_ret(KSYS_TCP_ACCEPT, -RET_BADH, 0);
+		return;
 	}
 
 	if (api->id) {
@@ -539,11 +549,9 @@ long bsys_tcp_accept(hid_t handle, unsigned long cookie)
 		recv_a_pbuf(api, tmp);
 		tmp = tmp->tcp_api_next;
 	}
-
-	return RET_OK;
 }
 
-long bsys_tcp_reject(hid_t handle)
+void bsys_tcp_reject(hid_t handle)
 {
 	/*
 	 * FIXME: LWIP's synchronous handling of accepts
@@ -552,22 +560,20 @@ long bsys_tcp_reject(hid_t handle)
 
 	KSTATS_VECTOR(bsys_tcp_reject);
 
-	log_err("tcpapi: bsys_tcp_reject() is not implemented\n");
-
-	return -RET_NOTSUP;
+	panic("tcpapi: bsys_tcp_reject() is not implemented\n");
 }
 
-ssize_t bsys_tcp_send(hid_t handle, void *addr, size_t len)
+void bsys_tcp_send(hid_t handle, void *addr, size_t len)
 {
 	KSTATS_VECTOR(bsys_tcp_send);
 
 	log_debug("tcpapi: bsys_tcp_send() - addr %p, len %lx\n",
 		  addr, len);
 
-	return -RET_NOTSUP;
+	panic("tcpapi: bsys_tcp_send() is not implemented\n");
 }
 
-ssize_t bsys_tcp_sendv(hid_t handle, struct sg_entry __user *ents,
+void bsys_tcp_sendv(hid_t handle, struct sg_entry __user *ents,
 		       unsigned int nrents)
 {
 	struct eth_fg *cur_fg;
@@ -582,14 +588,23 @@ ssize_t bsys_tcp_sendv(hid_t handle, struct sg_entry __user *ents,
 
 	if (unlikely(!api)) {
 		log_debug("tcpapi: invalid handle\n");
-		return -RET_BADH;
+		usys_ksys_ret(KSYS_TCP_SENDV, -RET_BADH, 0);
+		return;
 	}
 
-	if (unlikely(!api->alive))
-		return -RET_CLOSED;
+	if (unlikely(!api->alive)) {
+		api->lasterr.sysnr = KSYS_TCP_SENDV;
+		api->lasterr.err = -RET_CLOSED;
+		pcb_ready_enqueue(api);
+		return;
+	}
 
-	if (unlikely(!uaccess_okay(ents, nrents * sizeof(struct sg_entry))))
-		return -RET_FAULT;
+	if (unlikely(!uaccess_okay(ents, nrents * sizeof(struct sg_entry)))) {
+		api->lasterr.sysnr = KSYS_TCP_SENDV;
+		api->lasterr.err = -RET_FAULT;
+		pcb_ready_enqueue(api);
+		return;
+	}
 
 	nrents = min(nrents, MAX_SG_ENTRIES);
 	for (i = 0; i < nrents; i++) {
@@ -637,11 +652,9 @@ ssize_t bsys_tcp_sendv(hid_t handle, struct sg_entry __user *ents,
 		pcb_ready_enqueue(api);
 		spin_unlock(&percpu_get(pcb_ready_queue).lock);
 	}
-
-	return 0;
 }
 
-long bsys_tcp_recv_done(hid_t handle, size_t len)
+void bsys_tcp_recv_done(hid_t handle, size_t len)
 {
 	struct eth_fg *cur_fg;
 	struct tcpapi_pcb *api = handle_to_tcpapi(handle, &cur_fg);
@@ -654,7 +667,8 @@ long bsys_tcp_recv_done(hid_t handle, size_t len)
 
 	if (unlikely(!api)) {
 		log_debug("tcpapi: invalid handle\n");
-		return -RET_BADH;
+		usys_ksys_ret(KSYS_TCP_RECV_DONE, -RET_BADH, 0);
+		return;
 	}
 
 	recvd = api->recvd;
@@ -672,10 +686,9 @@ long bsys_tcp_recv_done(hid_t handle, size_t len)
 	}
 
 	api->recvd = recvd;
-	return RET_OK;
 }
 
-long bsys_tcp_close(hid_t handle)
+void bsys_tcp_close(hid_t handle)
 {
 	struct eth_fg *cur_fg;
 	struct tcpapi_pcb *api = handle_to_tcpapi(handle, &cur_fg);
@@ -687,7 +700,8 @@ long bsys_tcp_close(hid_t handle)
 
 	if (unlikely(!api)) {
 		log_debug("tcpapi: invalid handle\n");
-		return -RET_BADH;
+		usys_ksys_ret(KSYS_TCP_CLOSE, -RET_BADH, 0);
+		return;
 	}
 
 	if (api->pcb) {
@@ -710,7 +724,6 @@ long bsys_tcp_close(hid_t handle)
 		api->flags |= PCB_FLAG_CLOSED;
 	else
 		mempool_free(&percpu_get(pcb_mempool), api);
-	return RET_OK;
 }
 
 #if CONFIG_PRINT_CONNECTION_COUNT
@@ -1075,7 +1088,7 @@ struct eth_fg *get_local_port_and_set_queue(struct ip_tuple *id)
 	return 0;
 }
 
-long bsys_tcp_connect(struct ip_tuple __user *id, unsigned long cookie)
+void bsys_tcp_connect(struct ip_tuple __user *id, unsigned long cookie)
 {
 	err_t err;
 	struct ip_tuple tmp;
@@ -1088,17 +1101,18 @@ long bsys_tcp_connect(struct ip_tuple __user *id, unsigned long cookie)
 	log_debug("tcpapi: bsys_tcp_connect() - id %p, cookie %lx\n",
 		  id, cookie);
 
-	percpu_get(syscall_cookie) = cookie;
-
 	if (unlikely(copy_from_user(id, &tmp, sizeof(struct ip_tuple)))) {
-		return -RET_FAULT;
+		usys_ksys_ret(KSYS_TCP_CONNECT, -RET_FAULT, 0);
+		return;
 	}
 
 	tmp.src_ip = CFG.host_addr.addr;
 
 	struct eth_fg *cur_fg = get_local_port_and_set_queue(&tmp);
-	if (unlikely(!cur_fg))
-		return -RET_FAULT;
+	if (unlikely(!cur_fg)) {
+		usys_ksys_ret(KSYS_TCP_CONNECT, -RET_FAULT, 0);
+		return;
+	}
 
 
 	pcb = tcp_new(cur_fg);
@@ -1147,13 +1161,14 @@ long bsys_tcp_connect(struct ip_tuple __user *id, unsigned long cookie)
 	if (unlikely(err != ERR_OK))
 		goto connect_fail;
 
-	return api->handle;
+	usys_ksys_ret(KSYS_TCP_CONNECT, api->handle, api->cookie);
+	return;
 
 connect_fail:
 	tcp_abort(cur_fg, pcb);
 pcb_fail:
 
-	return -RET_NOMEM;
+	usys_ksys_ret(KSYS_TCP_CONNECT, -RET_NOMEM, 0);
 }
 
 

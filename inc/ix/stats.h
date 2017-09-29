@@ -5,7 +5,11 @@
 
 #define STATS \
 	COUNTER(llc_load_misses) \
-	COUNTER(steals)
+	COUNTER(events) \
+	COUNTER(steals) \
+	COUNTER(usertime) \
+	HISTOGRAM(batch, 0, 20, 20) \
+	HISTOGRAM(xmit_batch, 0, 20, 20)
 
 #if CONFIG_STATS
 

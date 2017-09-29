@@ -359,6 +359,9 @@ void tcp_steal_idle_wait(uint64_t usecs)
 	struct pcb_ready_queue *remote_queue;
 	struct tcpapi_pcb *api;
 	struct queue_node *n;
+#if CONFIG_STATS
+	int events_before, events_after;
+#endif
 
 	deadline = rdtsc() + usecs * cycles_per_us;
 	do {
@@ -395,14 +398,24 @@ void tcp_steal_idle_wait(uint64_t usecs)
 					assert(!api->flags);
 					log_debug("steal success from %d %lx\n", cpu_id, api);
 					queue_pop_front(&remote_queue->queue);
+#if CONFIG_STATS
+					events_before = percpu_get(usys_arr)->len;
+#endif
 					__tcp_gen_usys(api);
+#if CONFIG_STATS
+					events_after = percpu_get(usys_arr)->len;
+#endif
 					ok = 1;
 				}
 				spin_unlock(&remote_queue->lock);
 			}
 
-			if (ok)
+			if (ok) {
+#if CONFIG_STATS
+				stats_counter_steals(events_after - events_before);
+#endif
 				return;
+			}
 		}
 		cpu_relax();
 	} while (rdtsc() < deadline);

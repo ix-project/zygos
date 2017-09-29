@@ -60,6 +60,10 @@ DEFINE_PERCPU(unsigned long, idle_cycles);
 DEFINE_PERCPU(bool, in_kernel);
 DEFINE_PERCPU(struct locked_bsys_arr, ksys_remote);
 
+#if CONFIG_STATS
+DEFINE_PERCPU(long, user_enter_tsc);
+#endif
+
 static const int usys_nr = div_up(sizeof(struct bsys_arr) +
 				  UARR_MIN_CAPACITY * sizeof(struct bsys_desc),
 				  PGSIZE_2MB);
@@ -278,6 +282,8 @@ out:
 	for (int i = 0; i < percpu_get(usys_arr)->len; i++)
 		log_desc("to userspace", i, true, false, &percpu_get(usys_arr)->descs[i]);
 
+	stats_counter_events(percpu_get(usys_arr)->len);
+
 	percpu_get(in_kernel) = false;
 	return ret;
 }
@@ -461,10 +467,16 @@ void do_syscall(struct dune_tf *tf, uint64_t sysnr)
 		return;
 	}
 
+#if CONFIG_STATS
+	stats_counter_usertime((rdtsc() - percpu_get(user_enter_tsc)) / cycles_per_us);
+#endif
 	KSTATS_POP(NULL);
 	tf->rax = (uint64_t) sys_tbl[sysnr](tf->rdi, tf->rsi, tf->rdx,
 					    tf->rcx, tf->r8, tf->r9);
 	KSTATS_PUSH(user, NULL);
+#if CONFIG_STATS
+	percpu_get(user_enter_tsc) = rdtsc();
+#endif
 }
 
 /**

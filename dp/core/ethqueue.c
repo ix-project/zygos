@@ -30,6 +30,7 @@
 #include <ix/ethdev.h>
 #include <ix/log.h>
 #include <ix/control_plane.h>
+#include <ix/stats.h>
 
 /* Accumulate metrics period (in us) */
 #define METRICS_PERIOD_US 10000
@@ -212,6 +213,9 @@ int eth_process_recv(void)
 	KSTATS_BACKLOG_INC(backlog);
 #endif
 
+	if (count)
+		stats_histogram_batch(count);
+
 	return empty;
 }
 
@@ -225,6 +229,9 @@ void eth_process_send(void)
 
 	for (i = 0; i < percpu_get(eth_num_queues); i++) {
 		txq = percpu_get(eth_txqs[i]);
+
+		if (txq->len)
+			stats_histogram_xmit_batch(txq->len);
 
 		nr = eth_tx_xmit(txq, txq->len, txq->bufs);
 		if (unlikely(nr != txq->len))
